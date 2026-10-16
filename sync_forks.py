@@ -15,6 +15,8 @@ Configuração (variáveis de ambiente):
   TELEGRAM_BOT_TOKEN  token do bot do Telegram (opcional, ativa as notificações)
   TELEGRAM_CHAT_ID    chat/grupo que recebe as notificações
   TELEGRAM_NOTIFY_SYNC  "0" para não avisar syncs bem-sucedidos (padrão: "1")
+  NOTIFY_SOURCE       nome exibido no topo das notificações
+                      (padrão: nome do serviço no Render, ou "sync-fork")
 
 Formato de cada item da lista:
   {
@@ -168,10 +170,11 @@ def error_message(resp):
 class TelegramNotifier:
     """Envia avisos ao Telegram sem repetir o mesmo erro a cada ciclo."""
 
-    def __init__(self, token, chat_id, notify_sync=True):
+    def __init__(self, token, chat_id, notify_sync=True, source="sync-fork"):
         self.token = token
         self.chat_id = chat_id
         self.notify_sync = notify_sync
+        self.source = source
         self.session = requests.Session()
         self.last_errors = {}  # chave -> (assinatura do erro, mensagem de recuperação)
 
@@ -183,7 +186,8 @@ class TelegramNotifier:
             if token or chat_id:
                 log.warning("Telegram desativado: defina TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID")
             return None
-        return cls(token, chat_id, os.environ.get("TELEGRAM_NOTIFY_SYNC", "1") != "0")
+        source = os.environ.get("NOTIFY_SOURCE") or os.environ.get("RENDER_SERVICE_NAME") or "sync-fork"
+        return cls(token, chat_id, os.environ.get("TELEGRAM_NOTIFY_SYNC", "1") != "0", source)
 
     def send(self, text):
         try:
@@ -191,7 +195,7 @@ class TelegramNotifier:
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
                 json={
                     "chat_id": self.chat_id,
-                    "text": text,
+                    "text": f"📦 <b>{html.escape(self.source)}</b>\n\n{text}",
                     "parse_mode": "HTML",
                     "disable_web_page_preview": True,
                 },
@@ -211,7 +215,7 @@ class TelegramNotifier:
     def ok(self, fork):
         self._recovered([fork, *GLOBAL_ERRORS])
 
-    def failed(self, key, title, recovered, error):
+    def failed(self, key, title, recovered, error, forks=()):
         if key not in GLOBAL_ERRORS:
             # O GitHub respondeu e aceitou o token: problemas gerais anteriores foram resolvidos.
             self._recovered(GLOBAL_ERRORS)
@@ -220,6 +224,8 @@ class TelegramNotifier:
             return  # mesmo erro já avisado: não repete a cada ciclo
         self.last_errors[key] = (signature, recovered)
         lines = [f"❌ <b>{title}</b>", "", error.friendly]
+        if forks:
+            lines += ["", f"📁 <b>Forks afetados:</b> {html.escape(', '.join(forks))}"]
         if error.action:
             lines += ["", f"🔧 <b>O que fazer:</b> {error.action}"]
         lines += ["", f"<i>Detalhe técnico:</i> <code>{html.escape(str(error))}</code>"]
@@ -370,7 +376,7 @@ def run_once(gh, entries, notifier=None):
                 results["failed"] += len(entries) - index
                 if notifier:
                     title, recovered = GLOBAL_ERRORS[exc.kind]
-                    notifier.failed(exc.kind, title, recovered, exc)
+                    notifier.failed(exc.kind, title, recovered, exc, [e["fork"] for e in entries])
                 break
             results["failed"] += 1
             if notifier:

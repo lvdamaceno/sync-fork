@@ -33,6 +33,7 @@ Crie um token em https://github.com/settings/tokens:
 2. Mande qualquer mensagem para o bot (ou adicione-o a um grupo e mande uma mensagem lá).
 3. Abra `https://api.telegram.org/bot<TOKEN>/getUpdates` e copie o `chat.id` (em grupos ele é negativo).
 4. Defina as variáveis de ambiente `TELEGRAM_BOT_TOKEN` e `TELEGRAM_CHAT_ID`.
+5. (Opcional) Defina `NOTIFY_SOURCE` com o nome que aparece no topo de cada mensagem (padrão: nome do serviço no Render), para saber de onde veio a notificação.
 
 Avisos enviados:
 

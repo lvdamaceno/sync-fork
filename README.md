@@ -36,9 +36,19 @@ Crie um token em https://github.com/settings/tokens:
 
 Avisos enviados:
 
-- 🔄 fork sincronizado (desative com `TELEGRAM_NOTIFY_SYNC=0`);
-- ❌ falha ao sincronizar (ex.: conflito). O mesmo erro só é avisado uma vez, não a cada minuto;
-- ✅ o fork voltou a sincronizar depois de uma falha.
+- 🔄 **Fork atualizado**: quantos commits o fork recebeu (desative com `TELEGRAM_NOTIFY_SYNC=0`).
+- ❌ **Falha**: explica o problema e diz o que fazer, com o detalhe técnico no final:
+
+  | Erro | Aviso |
+  |---|---|
+  | HTTP 401 | token do GitHub errado ou vencido (um aviso só, não um por fork) |
+  | HTTP 403 | token sem permissão no repositório (ou sem permissão de workflows) |
+  | HTTP 404 | repositório/branch não encontrado ou sem acesso |
+  | Conflito | fork tem alterações que conflitam com o original |
+  | Limite da API / GitHub fora do ar | avisa que o script tenta de novo sozinho |
+
+  O mesmo erro só é avisado uma vez, não a cada minuto.
+- ✅ **Resolvido**: quando o problema deixa de acontecer.
 
 ## Rodar localmente
 

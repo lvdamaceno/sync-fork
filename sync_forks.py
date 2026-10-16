@@ -45,7 +45,77 @@ log = logging.getLogger("sync-forks")
 
 
 class SyncError(Exception):
-    pass
+    """Erro de sync com uma explicação amigável e o que fazer para resolver.
+
+    kind "auth", "rate_limit" e "unavailable" afetam todos os forks; os demais, só um.
+    """
+
+    def __init__(self, message, friendly=None, action=None, kind="other"):
+        super().__init__(message)
+        self.friendly = friendly or message
+        self.action = action
+        self.kind = kind
+
+
+GLOBAL_ERRORS = {
+    "auth": ("Problema com o token do GitHub", "O token do GitHub voltou a funcionar"),
+    "rate_limit": ("Limite da API do GitHub atingido", "O limite da API do GitHub foi liberado"),
+    "unavailable": ("GitHub indisponível", "A conexão com o GitHub voltou ao normal"),
+}
+
+RETRY_LATER = "Nada a fazer: o script tenta de novo sozinho no próximo ciclo."
+WORKFLOW_ACTION = (
+    "Dê ao token a permissão <b>Workflows: Read and write</b> (fine-grained) "
+    "ou o escopo <b>workflow</b> (classic) e atualize o GITHUB_TOKEN no Render."
+)
+
+
+def api_error(status, message, detail):
+    if status == 401:
+        return SyncError(
+            detail,
+            "O token do GitHub está errado ou venceu.",
+            "Gere um novo token no GitHub e atualize a variável <b>GITHUB_TOKEN</b> "
+            "no Render (serviço sync-forks → Environment).",
+            "auth",
+        )
+    if "workflow" in message.lower():
+        return SyncError(
+            detail,
+            "O repositório original alterou arquivos de <code>.github/workflows</code> "
+            "e o token não tem permissão para atualizar workflows.",
+            WORKFLOW_ACTION,
+            "permission",
+        )
+    if status == 403:
+        return SyncError(
+            detail,
+            "O token do GitHub não tem permissão para acessar ou alterar este repositório.",
+            "Confira se o token inclui o fork e tem a permissão <b>Contents: Read and write</b>.",
+            "permission",
+        )
+    if status == 404:
+        return SyncError(
+            detail,
+            "O repositório ou branch não foi encontrado, ou o token não tem acesso a ele.",
+            "Confira os nomes no <code>forks.json</code> e se o token inclui o fork "
+            "e o repositório original.",
+            "not_found",
+        )
+    if status >= 500:
+        return SyncError(detail, f"O GitHub está instável no momento (HTTP {status}).", RETRY_LATER, "unavailable")
+    return SyncError(detail, f"O GitHub recusou a operação (HTTP {status}): {message}")
+
+
+def conflict_error(label):
+    return SyncError(
+        f"{label}: conflito de merge",
+        "O fork tem alterações que conflitam com o repositório original, "
+        "então o sync automático não é possível.",
+        "Resolva o conflito manualmente (merge local ou botão <b>Sync fork</b> no GitHub). "
+        "Depois disso o script volta a sincronizar sozinho.",
+        "conflict",
+    )
 
 
 class GitHub:
@@ -61,20 +131,38 @@ class GitHub:
         )
 
     def request(self, method, path, ok=(200,), **kwargs):
-        resp = self.session.request(method, API_URL + path, timeout=30, **kwargs)
+        try:
+            resp = self.session.request(method, API_URL + path, timeout=30, **kwargs)
+        except requests.RequestException as exc:
+            raise SyncError(
+                f"{method} {path} -> {type(exc).__name__}: {exc}",
+                "Não foi possível conectar ao GitHub.",
+                RETRY_LATER,
+                "unavailable",
+            ) from exc
         if resp.status_code in ok:
             return resp
         if resp.status_code in (403, 429) and resp.headers.get("X-RateLimit-Remaining") == "0":
             reset = int(resp.headers.get("X-RateLimit-Reset", "0"))
-            raise SyncError(f"limite da API do GitHub atingido (libera em {max(0, reset - int(time.time()))}s)")
-        try:
-            message = resp.json().get("message", resp.text)
-        except ValueError:
-            message = resp.text
-        raise SyncError(f"{method} {path} -> HTTP {resp.status_code}: {message}")
+            minutes = max(1, round((reset - time.time()) / 60))
+            raise SyncError(
+                f"limite da API do GitHub atingido (libera em ~{minutes} min)",
+                "O limite de requisições da API do GitHub foi atingido.",
+                f"{RETRY_LATER} Se acontecer com frequência, aumente <b>INTERVAL_SECONDS</b> no Render.",
+                "rate_limit",
+            )
+        message = error_message(resp)
+        raise api_error(resp.status_code, message, f"{method} {path} -> HTTP {resp.status_code}: {message}")
 
     def get(self, path):
         return self.request("GET", path).json()
+
+
+def error_message(resp):
+    try:
+        return resp.json().get("message", resp.text)
+    except ValueError:
+        return resp.text
 
 
 class TelegramNotifier:
@@ -85,7 +173,7 @@ class TelegramNotifier:
         self.chat_id = chat_id
         self.notify_sync = notify_sync
         self.session = requests.Session()
-        self.last_errors = {}  # fork -> última mensagem de erro já notificada
+        self.last_errors = {}  # chave -> (assinatura do erro, mensagem de recuperação)
 
     @classmethod
     def from_env(cls):
@@ -116,22 +204,32 @@ class TelegramNotifier:
             log.warning("Falha ao notificar no Telegram: %s", type(exc).__name__)
 
     def synced(self, fork, detail):
-        self._recovered(fork)
+        self.ok(fork)
         if self.notify_sync:
-            self.send(f"🔄 <b>Fork sincronizado</b>\n{html.escape(detail)}")
+            self.send(f"🔄 <b>Fork atualizado</b>\n{html.escape(detail)}")
 
-    def up_to_date(self, fork):
-        self._recovered(fork)
+    def ok(self, fork):
+        self._recovered([fork, *GLOBAL_ERRORS])
 
-    def failed(self, fork, error):
-        if self.last_errors.get(fork) == error:
-            return
-        self.last_errors[fork] = error
-        self.send(f"❌ <b>Falha ao sincronizar</b> {html.escape(fork)}\n{html.escape(error)}")
+    def failed(self, key, title, recovered, error):
+        if key not in GLOBAL_ERRORS:
+            # O GitHub respondeu e aceitou o token: problemas gerais anteriores foram resolvidos.
+            self._recovered(GLOBAL_ERRORS)
+        signature = (error.kind, error.friendly)
+        if self.last_errors.get(key, (None,))[0] == signature:
+            return  # mesmo erro já avisado: não repete a cada ciclo
+        self.last_errors[key] = (signature, recovered)
+        lines = [f"❌ <b>{title}</b>", "", error.friendly]
+        if error.action:
+            lines += ["", f"🔧 <b>O que fazer:</b> {error.action}"]
+        lines += ["", f"<i>Detalhe técnico:</i> <code>{html.escape(str(error))}</code>"]
+        self.send("\n".join(lines))
 
-    def _recovered(self, fork):
-        if self.last_errors.pop(fork, None) is not None:
-            self.send(f"✅ <b>{html.escape(fork)}</b> voltou a sincronizar normalmente")
+    def _recovered(self, keys):
+        for key in keys:
+            entry = self.last_errors.pop(key, None)
+            if entry:
+                self.send(f"✅ {entry[1]}")
 
 
 def normalize_repo(value):
@@ -180,7 +278,12 @@ def sync_fork(gh, entry):
     fork = entry["fork"]
     repo = gh.get(f"/repos/{fork}")
     if not repo.get("fork"):
-        raise SyncError(f"{fork} não é um fork")
+        raise SyncError(
+            f"{fork} não é um fork",
+            "Este repositório não é um fork.",
+            "Confira o campo <code>fork</code> no <code>forks.json</code>.",
+            "config",
+        )
 
     parent = repo["parent"]
     upstream = entry.get("upstream") or parent["full_name"]
@@ -195,6 +298,7 @@ def sync_fork(gh, entry):
         upstream_branch = gh.get(f"/repos/{upstream}")["default_branch"]
 
     label = f"{fork}@{branch} <- {upstream}@{upstream_branch}"
+    summary = f"{fork} ({branch}) recebeu {{}} commit(s) de {upstream} ({upstream_branch}) via {{}}."
     upstream_owner = upstream.split("/")[0]
 
     # base = branch do fork, head = branch do upstream.
@@ -220,12 +324,12 @@ def sync_fork(gh, entry):
             "POST", f"/repos/{fork}/merge-upstream", ok=(200, 409, 422), json={"branch": branch}
         )
         if resp.status_code == 409:
-            raise SyncError(f"{label}: conflito de merge, resolva manualmente")
+            raise conflict_error(label)
         if resp.status_code == 422:
-            raise SyncError(f"{label}: não foi possível sincronizar ({resp.json().get('message')})")
-        merge_type = resp.json().get("merge_type", "ok")
+            raise api_error(422, error_message(resp), f"{label}: HTTP 422: {error_message(resp)}")
+        merge_type = resp.json().get("merge_type", "merge")
         log.info("%s: sincronizado (%s)", label, merge_type)
-        return "synced", f"{label}: {missing} commit(s) ({merge_type})"
+        return "synced", summary.format(missing, merge_type)
 
     upstream_sha = gh.get(f"/repos/{upstream}/branches/{quote(upstream_branch, safe='')}")["commit"]["sha"]
     if status == "ahead":
@@ -235,7 +339,7 @@ def sync_fork(gh, entry):
             json={"sha": upstream_sha, "force": False},
         )
         log.info("%s: sincronizado (fast-forward para %s)", label, upstream_sha[:7])
-        return "synced", f"{label}: {missing} commit(s) (fast-forward)"
+        return "synced", summary.format(missing, "fast-forward")
     else:
         resp = gh.request(
             "POST",
@@ -248,29 +352,41 @@ def sync_fork(gh, entry):
             },
         )
         if resp.status_code == 409:
-            raise SyncError(f"{label}: conflito de merge, resolva manualmente")
+            raise conflict_error(label)
         log.info("%s: sincronizado (merge)", label)
-        return "synced", f"{label}: {missing} commit(s) (merge)"
+        return "synced", summary.format(missing, "merge")
 
 
 def run_once(gh, entries, notifier=None):
     results = {"up_to_date": 0, "synced": 0, "failed": 0}
-    for entry in entries:
+    for index, entry in enumerate(entries):
         fork = entry["fork"]
         try:
             result, detail = sync_fork(gh, entry)
-        except (SyncError, requests.RequestException) as exc:
-            results["failed"] += 1
+        except SyncError as exc:
             log.error("%s: %s", fork, exc)
+            if exc.kind in GLOBAL_ERRORS:
+                # Afeta todos os forks: um único aviso e encerra o ciclo.
+                results["failed"] += len(entries) - index
+                if notifier:
+                    title, recovered = GLOBAL_ERRORS[exc.kind]
+                    notifier.failed(exc.kind, title, recovered, exc)
+                break
+            results["failed"] += 1
             if notifier:
-                notifier.failed(fork, str(exc))
+                notifier.failed(
+                    fork,
+                    f"Falha ao sincronizar {html.escape(fork)}",
+                    f"<b>{html.escape(fork)}</b> voltou a sincronizar normalmente",
+                    exc,
+                )
             continue
         results[result] += 1
         if notifier:
             if result == "synced":
                 notifier.synced(fork, detail)
             else:
-                notifier.up_to_date(fork)
+                notifier.ok(fork)
     log.info(
         "Resumo: %d atualizado(s), %d sincronizado(s), %d falha(s)",
         results["up_to_date"], results["synced"], results["failed"],

@@ -1,0 +1,23 @@
+services:
+  # Background Worker do Render: processo contínuo que verifica os forks a cada INTERVAL_SECONDS.
+  - type: worker
+    name: sync-forks
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python sync_forks.py --loop
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.7"
+      - key: INTERVAL_SECONDS
+        value: "60"
+      - key: GITHUB_TOKEN
+        sync: false # informe o valor no painel do Render (não vai para o repositório)
+      - key: FORKS_CONFIG
+        sync: false # opcional: JSON com os forks (senão usa forks.json)
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false # opcional: token do bot (BotFather)
+      - key: TELEGRAM_CHAT_ID
+        sync: false # opcional: chat ou grupo que recebe os avisos
+      - key: TELEGRAM_NOTIFY_SYNC
+        value: "1" # "0" para avisar só falhas

@@ -65,6 +65,9 @@ GLOBAL_ERRORS = {
     "unavailable": ("GitHub indisponível", "A conexão com o GitHub voltou ao normal"),
 }
 
+MAX_COMMITS_LISTED = 10  # commits mostrados na notificação de sync
+MAX_COMMIT_TITLE = 120  # caracteres da primeira linha de cada commit
+
 RETRY_LATER = "Nada a fazer: o script tenta de novo sozinho no próximo ciclo."
 WORKFLOW_ACTION = (
     "Dê ao token a permissão <b>Workflows: Read and write</b> (fine-grained) "
@@ -207,10 +210,15 @@ class TelegramNotifier:
             # A mensagem da exceção pode conter a URL com o token, então não é logada.
             log.warning("Falha ao notificar no Telegram: %s", type(exc).__name__)
 
-    def synced(self, fork, detail):
+    def synced(self, fork, detail, commits=(), compare_url=None):
         self.ok(fork)
         if self.notify_sync:
-            self.send(f"🔄 <b>Fork atualizado</b>\n{html.escape(detail)}")
+            lines = ["🔄 <b>Fork atualizado</b>", html.escape(detail)]
+            if commits:
+                lines += ["", "📝 <b>Commits:</b>", *format_commits(commits)]
+            if compare_url:
+                lines += ["", f'<a href="{html.escape(compare_url)}">Ver alterações no GitHub</a>']
+            self.send("\n".join(lines))
 
     def ok(self, fork):
         self._recovered([fork, *GLOBAL_ERRORS])
@@ -236,6 +244,25 @@ class TelegramNotifier:
             entry = self.last_errors.pop(key, None)
             if entry:
                 self.send(f"✅ {entry[1]}")
+
+
+def format_commits(commits):
+    """Uma linha por commit (os mais recentes), com o título da mensagem e o autor."""
+    lines = []
+    hidden = len(commits) - MAX_COMMITS_LISTED
+    if hidden > 0:
+        lines.append(f"<i>… e mais {hidden} commit(s) anterior(es)</i>")
+    for commit in commits[-MAX_COMMITS_LISTED:]:
+        info = commit.get("commit", {})
+        title = (info.get("message") or "").strip().split("\n")[0] or "(sem mensagem)"
+        if len(title) > MAX_COMMIT_TITLE:
+            title = title[: MAX_COMMIT_TITLE - 1] + "…"
+        author = (commit.get("author") or {}).get("login") or info.get("author", {}).get("name")
+        line = f"• <code>{commit.get('sha', '')[:7]}</code> {html.escape(title)}"
+        if author:
+            line += f" — <i>{html.escape(author)}</i>"
+        lines.append(line)
+    return lines
 
 
 def normalize_repo(value):
@@ -316,10 +343,11 @@ def sync_fork(gh, entry):
     )
     status = compare["status"]
     missing = compare["ahead_by"]
+    changes = {"commits": compare.get("commits", []), "compare_url": compare.get("html_url")}
 
     if status in ("identical", "behind"):
         log.info("%s: atualizado", label)
-        return "up_to_date", label
+        return "up_to_date", label, {}
 
     log.info("%s: %d commit(s) atrás do upstream (%s), sincronizando...", label, missing, status)
 
@@ -335,7 +363,7 @@ def sync_fork(gh, entry):
             raise api_error(422, error_message(resp), f"{label}: HTTP 422: {error_message(resp)}")
         merge_type = resp.json().get("merge_type", "merge")
         log.info("%s: sincronizado (%s)", label, merge_type)
-        return "synced", summary.format(missing, merge_type)
+        return "synced", summary.format(missing, merge_type), changes
 
     upstream_sha = gh.get(f"/repos/{upstream}/branches/{quote(upstream_branch, safe='')}")["commit"]["sha"]
     if status == "ahead":
@@ -345,7 +373,7 @@ def sync_fork(gh, entry):
             json={"sha": upstream_sha, "force": False},
         )
         log.info("%s: sincronizado (fast-forward para %s)", label, upstream_sha[:7])
-        return "synced", summary.format(missing, "fast-forward")
+        return "synced", summary.format(missing, "fast-forward"), changes
     else:
         resp = gh.request(
             "POST",
@@ -360,7 +388,7 @@ def sync_fork(gh, entry):
         if resp.status_code == 409:
             raise conflict_error(label)
         log.info("%s: sincronizado (merge)", label)
-        return "synced", summary.format(missing, "merge")
+        return "synced", summary.format(missing, "merge"), changes
 
 
 def run_once(gh, entries, notifier=None):
@@ -368,7 +396,7 @@ def run_once(gh, entries, notifier=None):
     for index, entry in enumerate(entries):
         fork = entry["fork"]
         try:
-            result, detail = sync_fork(gh, entry)
+            result, detail, changes = sync_fork(gh, entry)
         except SyncError as exc:
             log.error("%s: %s", fork, exc)
             if exc.kind in GLOBAL_ERRORS:
@@ -390,7 +418,7 @@ def run_once(gh, entries, notifier=None):
         results[result] += 1
         if notifier:
             if result == "synced":
-                notifier.synced(fork, detail)
+                notifier.synced(fork, detail, **changes)
             else:
                 notifier.ok(fork)
     log.info(

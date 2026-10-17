@@ -37,7 +37,7 @@ Crie um token em https://github.com/settings/tokens:
 
 Avisos enviados:
 
-- 🔄 **Fork atualizado**: quantos commits o fork recebeu (desative com `TELEGRAM_NOTIFY_SYNC=0`).
+- 🔄 **Fork atualizado**: quantos commits o fork recebeu, com a mensagem e o autor de cada um (até os 10 mais recentes) e um link para as alterações no GitHub (desative com `TELEGRAM_NOTIFY_SYNC=0`).
 - ❌ **Falha**: explica o problema e diz o que fazer, com o detalhe técnico no final:
 
   | Erro | Aviso |

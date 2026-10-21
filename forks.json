@@ -1,10 +1,5 @@
 [
   {
-    "fork": "https://github.com/lvdamaceno/loja-casacontente",
-    "upstream": "https://github.com/appscontente/loja-casacontente",
-    "branch": "main"
-  },
-  {
     "fork": "https://github.com/lvdamaceno/casaliv-2026",
     "upstream": "https://github.com/appscontente/casaliv-2026",
     "branch": "main"

@@ -17,6 +17,8 @@ Configuração (variáveis de ambiente):
   TELEGRAM_NOTIFY_SYNC  "0" para não avisar syncs bem-sucedidos (padrão: "1")
   NOTIFY_SOURCE       nome exibido no topo das notificações
                       (padrão: nome do serviço no Render, ou "sync-fork")
+  UNAVAILABLE_ALERT_AFTER  falhas de conexão seguidas antes de avisar (padrão: 3)
+  TOKEN_WARN_DAYS     dias de antecedência para avisar que o token vai vencer (padrão: 7)
 
 Formato de cada item da lista:
   {
@@ -35,15 +37,38 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 API_URL = "https://api.github.com"
 DEFAULT_FORKS_FILE = Path(__file__).with_name("forks.json")
 
 log = logging.getLogger("sync-forks")
+
+
+def retrying_session():
+    """Sessão que repete na hora conexões derrubadas e erros 502/503/504 do servidor.
+
+    Evita que uma conexão keep-alive fechada pelo GitHub entre os ciclos vire um erro.
+    """
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=2,
+        backoff_factor=1,
+        status_forcelist=(502, 503, 504),
+        allowed_methods=None,  # as escritas usadas (merge, fast-forward) podem ser repetidas
+        raise_on_status=False,  # esgotadas as tentativas, a resposta segue para o tratamento normal
+        respect_retry_after_header=True,
+    )
+    session = requests.Session()
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    return session
 
 
 class SyncError(Exception):
@@ -67,6 +92,7 @@ GLOBAL_ERRORS = {
 
 MAX_COMMITS_LISTED = 10  # commits mostrados na notificação de sync
 MAX_COMMIT_TITLE = 120  # caracteres da primeira linha de cada commit
+TOKEN_WARN_DAYS = int(os.environ.get("TOKEN_WARN_DAYS", "7"))  # antecedência do aviso de token vencendo
 
 RETRY_LATER = "Nada a fazer: o script tenta de novo sozinho no próximo ciclo."
 WORKFLOW_ACTION = (
@@ -123,9 +149,21 @@ def conflict_error(label):
     )
 
 
+def parse_token_expiration(value):
+    """Lê o cabeçalho github-authentication-token-expiration ("2026-12-31 23:59:59 UTC")."""
+    try:
+        return datetime.strptime(value.replace("UTC", "+0000"), "%Y-%m-%d %H:%M:%S %z")
+    except ValueError:
+        log.debug("Validade do token em formato desconhecido: %r", value)
+        return None
+
+
 class GitHub:
     def __init__(self, token):
-        self.session = requests.Session()
+        self.token_expires_at = None
+        self.token_warned_on = None  # dia do último aviso de token vencendo
+        self.etags = {}  # path -> (ETag, JSON): respostas 304 não contam no limite da API
+        self.session = retrying_session()
         self.session.headers.update(
             {
                 "Authorization": f"Bearer {token}",
@@ -145,6 +183,9 @@ class GitHub:
                 RETRY_LATER,
                 "unavailable",
             ) from exc
+        expiration = resp.headers.get("github-authentication-token-expiration")
+        if expiration:
+            self.token_expires_at = parse_token_expiration(expiration)
         if resp.status_code in ok:
             return resp
         if resp.status_code in (403, 429) and resp.headers.get("X-RateLimit-Remaining") == "0":
@@ -160,7 +201,15 @@ class GitHub:
         raise api_error(resp.status_code, message, f"{method} {path} -> HTTP {resp.status_code}: {message}")
 
     def get(self, path):
-        return self.request("GET", path).json()
+        cached = self.etags.get(path)
+        headers = {"If-None-Match": cached[0]} if cached else {}
+        resp = self.request("GET", path, ok=(200, 304), headers=headers)
+        if resp.status_code == 304:
+            return cached[1]
+        data = resp.json()
+        if resp.headers.get("ETag"):
+            self.etags[path] = (resp.headers["ETag"], data)
+        return data
 
 
 def error_message(resp):
@@ -173,13 +222,15 @@ def error_message(resp):
 class TelegramNotifier:
     """Envia avisos ao Telegram sem repetir o mesmo erro a cada ciclo."""
 
-    def __init__(self, token, chat_id, notify_sync=True, source="sync-fork"):
+    def __init__(self, token, chat_id, notify_sync=True, source="sync-fork", unavailable_after=3):
         self.token = token
         self.chat_id = chat_id
         self.notify_sync = notify_sync
         self.source = source
-        self.session = requests.Session()
+        self.unavailable_after = unavailable_after
+        self.session = retrying_session()
         self.last_errors = {}  # chave -> (assinatura do erro, mensagem de recuperação)
+        self.unavailable_streak = 0  # ciclos seguidos sem conseguir falar com o GitHub
 
     @classmethod
     def from_env(cls):
@@ -190,7 +241,13 @@ class TelegramNotifier:
                 log.warning("Telegram desativado: defina TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID")
             return None
         source = os.environ.get("NOTIFY_SOURCE") or os.environ.get("RENDER_SERVICE_NAME") or "sync-fork"
-        return cls(token, chat_id, os.environ.get("TELEGRAM_NOTIFY_SYNC", "1") != "0", source)
+        return cls(
+            token,
+            chat_id,
+            os.environ.get("TELEGRAM_NOTIFY_SYNC", "1") != "0",
+            source,
+            max(1, int(os.environ.get("UNAVAILABLE_ALERT_AFTER", "3"))),
+        )
 
     def send(self, text):
         try:
@@ -221,9 +278,17 @@ class TelegramNotifier:
             self.send("\n".join(lines))
 
     def ok(self, fork):
+        self.unavailable_streak = 0
         self._recovered([fork, *GLOBAL_ERRORS])
 
     def failed(self, key, title, recovered, error, forks=()):
+        if key == "unavailable":
+            # Quedas isoladas se resolvem sozinhas no ciclo seguinte: só avisa se persistirem.
+            self.unavailable_streak += 1
+            if self.unavailable_streak < self.unavailable_after:
+                return
+        else:
+            self.unavailable_streak = 0
         if key not in GLOBAL_ERRORS:
             # O GitHub respondeu e aceitou o token: problemas gerais anteriores foram resolvidos.
             self._recovered(GLOBAL_ERRORS)
@@ -238,6 +303,14 @@ class TelegramNotifier:
             lines += ["", f"🔧 <b>O que fazer:</b> {error.action}"]
         lines += ["", f"<i>Detalhe técnico:</i> <code>{html.escape(str(error))}</code>"]
         self.send("\n".join(lines))
+
+    def token_expiring(self, expires_at, days):
+        when = "hoje" if days <= 0 else f"em {days} dia(s)"
+        self.send(
+            f"⏳ <b>O token do GitHub vence {when}</b> ({expires_at:%d/%m/%Y})\n\n"
+            "🔧 <b>O que fazer:</b> gere um novo token no GitHub e atualize a variável "
+            "<b>GITHUB_TOKEN</b> no Render antes do vencimento."
+        )
 
     def _recovered(self, keys):
         for key in keys:
@@ -346,7 +419,7 @@ def sync_fork(gh, entry):
     changes = {"commits": compare.get("commits", []), "compare_url": compare.get("html_url")}
 
     if status in ("identical", "behind"):
-        log.info("%s: atualizado", label)
+        log.debug("%s: atualizado", label)
         return "up_to_date", label, {}
 
     log.info("%s: %d commit(s) atrás do upstream (%s), sincronizando...", label, missing, status)
@@ -421,11 +494,28 @@ def run_once(gh, entries, notifier=None):
                 notifier.synced(fork, detail, **changes)
             else:
                 notifier.ok(fork)
-    log.info(
+    # Ciclos sem novidade só aparecem com LOG_LEVEL=DEBUG, para os erros não se perderem no log.
+    log.log(
+        logging.INFO if results["synced"] or results["failed"] else logging.DEBUG,
         "Resumo: %d atualizado(s), %d sincronizado(s), %d falha(s)",
         results["up_to_date"], results["synced"], results["failed"],
     )
+    warn_token_expiration(gh, notifier)
     return results["failed"] == 0
+
+
+def warn_token_expiration(gh, notifier):
+    """Avisa uma vez por dia quando o token do GitHub está perto de vencer."""
+    if not gh.token_expires_at:
+        return  # token sem validade (ou a resposta não informou)
+    now = datetime.now(timezone.utc)
+    days = (gh.token_expires_at - now).days
+    if days >= TOKEN_WARN_DAYS or gh.token_warned_on == now.date():
+        return
+    gh.token_warned_on = now.date()
+    log.warning("O token do GitHub vence em %d dia(s) (%s)", days, gh.token_expires_at.date())
+    if notifier:
+        notifier.token_expiring(gh.token_expires_at, days)
 
 
 def main():

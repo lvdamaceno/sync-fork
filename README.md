@@ -48,7 +48,8 @@ Avisos enviados:
   | Conflito | fork tem alterações que conflitam com o original |
   | Limite da API / GitHub fora do ar | avisa que o script tenta de novo sozinho |
 
-  O mesmo erro só é avisado uma vez, não a cada minuto.
+  O mesmo erro só é avisado uma vez, não a cada ciclo. Quedas de conexão e erros 502/503/504 são repetidos na hora (até 3 vezes); se ainda assim o GitHub não responder, o aviso só sai depois de `UNAVAILABLE_ALERT_AFTER` ciclos seguidos (padrão: 3), para quedas isoladas não gerarem alarme.
+- ⏳ **Token vencendo**: uma vez por dia, quando faltarem menos de `TOKEN_WARN_DAYS` dias (padrão: 7) para o token do GitHub vencer.
 - ✅ **Resolvido**: quando o problema deixa de acontecer.
 
 ## Rodar localmente
@@ -56,13 +57,15 @@ Avisos enviados:
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 GITHUB_TOKEN=ghp_xxx .venv/bin/python sync_forks.py          # roda uma vez
-GITHUB_TOKEN=ghp_xxx .venv/bin/python sync_forks.py --loop   # roda a cada 60s
+GITHUB_TOKEN=ghp_xxx .venv/bin/python sync_forks.py --loop   # roda a cada INTERVAL_SECONDS (padrão: 60s)
 ```
 
 ## Deploy no Render
 
 1. Suba esta pasta para um repositório no GitHub.
-2. No Render: **New > Blueprint** e selecione o repositório. O `render.yaml` cria um **Background Worker** que roda `python sync_forks.py --loop` e verifica os forks a cada `INTERVAL_SECONDS` (padrão: 60s).
+2. No Render: **New > Blueprint** e selecione o repositório. O `render.yaml` cria um **Background Worker** que roda `python sync_forks.py --loop` e verifica os forks a cada `INTERVAL_SECONDS` (30s no `render.yaml`).
 3. No painel do Render, informe a variável de ambiente `GITHUB_TOKEN` (e, opcionalmente, `FORKS_CONFIG`). O token nunca deve ser commitado no repositório.
 
-Falhas de sync (ex.: conflito de merge) aparecem como `ERROR` nos logs do serviço; o processo continua rodando e tenta novamente no próximo ciclo.
+Falhas de sync (ex.: conflito de merge) aparecem como `ERROR` nos logs do serviço; o processo continua rodando e tenta novamente no próximo ciclo. Os logs só registram syncs, falhas e avisos; para ver também os ciclos sem novidade, defina `LOG_LEVEL=DEBUG`.
+
+As consultas usam ETag: quando nada mudou o GitHub responde `304`, que não conta no limite da API.

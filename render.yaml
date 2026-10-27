@@ -10,7 +10,7 @@ services:
       - key: PYTHON_VERSION
         value: "3.12.7"
       - key: INTERVAL_SECONDS
-        value: "60"
+        value: "30"
       - key: GITHUB_TOKEN
         sync: false # informe o valor no painel do Render (não vai para o repositório)
       - key: FORKS_CONFIG
